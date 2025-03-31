@@ -9,12 +9,12 @@ import (
 
 func RunPipeline(cmds ...cmd) {
 	var wg sync.WaitGroup
-	in := make(chan interface{})
+	in := make(chan any)
 
 	for _, c := range cmds {
-		out := make(chan interface{})
+		out := make(chan any)
 		wg.Add(1)
-		go func(c cmd, in, out chan interface{}) {
+		go func(c cmd, in, out chan any) {
 			defer wg.Done()
 			defer close(out)
 			c(in, out)
@@ -25,7 +25,7 @@ func RunPipeline(cmds ...cmd) {
 	wg.Wait()
 }
 
-func SelectUsers(in, out chan interface{}) {
+func SelectUsers(in, out chan any) {
 	// 	in - string
 	// 	out - User
 	var wg sync.WaitGroup
@@ -33,67 +33,78 @@ func SelectUsers(in, out chan interface{}) {
 
 	for email := range in {
 		wg.Add(1)
-		go func(email string) {
+		go func(e interface{}) {
 			defer wg.Done()
+
+			email, ok := e.(string)
+			if !ok {
+				log.Printf("Ожидался string, получено %T", e)
+				return
+			}
 			user := GetUser(email)
 			if _, loaded := checkedEmails.LoadOrStore(user, struct{}{}); !loaded {
 				out <- user
 			}
 
-		}(email.(string))
+		}(email)
 	}
 
 	wg.Wait()
 }
 
-func SelectMessages(in, out chan interface{}) {
+func SelectMessages(in, out chan any) {
 	// 	in - User
 	// 	out - MsgID
 	var wg sync.WaitGroup
-	usersBatch := []User{}
+	usersBatch := make([]User, 0, len(in))
 
-	for user := range in {
-		usersBatch = append(usersBatch, user.(User))
+	batchFunc := func(batch ...User) {
+		defer wg.Done()
+		msgs, err := GetMessages(batch...)
+		if err != nil {
+			log.Printf("Ошибка при получении: %v", err)
+			return
+		}
+		for _, msg := range msgs {
+			out <- msg
+		}
+	}
+
+	for u := range in {
+		user, ok := u.(User)
+		if !ok {
+			log.Printf("Ожидался User, получено %T", u)
+			continue
+		}
+
+		usersBatch = append(usersBatch, user)
 		if len(usersBatch) == GetMessagesMaxUsersBatch {
 			wg.Add(1)
-			go func(batch []User) {
-				defer wg.Done()
-				msgs, err := GetMessages(batch...)
-				if err != nil {
-					log.Printf("Ошибка при получении User: %v", err)
-				}
-				for _, msg := range msgs {
-					out <- msg
-				}
-			}(usersBatch)
-			usersBatch = []User{}
+			go batchFunc(usersBatch...)
+			usersBatch = make([]User, 0, GetMessagesMaxUsersBatch)
 		}
 	}
 
 	if len(usersBatch) > 0 {
-		wg.Add(1)
-		go func(batch []User) {
-			defer wg.Done()
-			msgs, err := GetMessages(batch...)
-			if err != nil {
-				log.Printf("Ошибка при получении Messages: %v", err)
-			}
-			for _, msg := range msgs {
-				out <- msg
-			}
-		}(usersBatch)
+		// wg.Add(1)
+		batchFunc(usersBatch...)
 	}
 
 	wg.Wait()
 }
 
-func CheckSpam(in, out chan interface{}) {
+func CheckSpam(in, out chan any) {
 	// in - MsgID
 	// out - MsgData
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, HasSpamMaxAsyncRequests)
 
-	for msgID := range in {
+	for mID := range in {
+		msgID, ok := mID.(MsgID)
+		if !ok {
+			log.Printf("Ожидался MsgID, получено %T", mID)
+			return
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(id MsgID) {
@@ -104,13 +115,13 @@ func CheckSpam(in, out chan interface{}) {
 				log.Printf("Ошибка при проверке: %v", err)
 			}
 			out <- MsgData{ID: id, HasSpam: hasSpam}
-		}(msgID.(MsgID))
+		}(msgID)
 	}
 
 	wg.Wait()
 }
 
-func CombineResults(in, out chan interface{}) {
+func CombineResults(in, out chan any) {
 	// in - MsgData
 	// out - string
 	messages := make([]MsgData, 0, len(in))
